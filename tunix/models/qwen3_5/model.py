@@ -657,16 +657,18 @@ class Attention(nnx.Module):
       attn = (
           jnp.einsum('BTHGD,BSHD->BHGTS', query_proj, key_proj) * self.scale
       )
-      if attn_mask is not None and cache is None:
-        # Support both [B, T_k] padding mask and [B, T_q, T_k] causal+padding mask.
-        # We only apply this during prefill (no cache). During cached decode the
-        # KV sequence length > query sequence length so the 2-D padding mask
-        # can't broadcast cleanly across the full [B, H, G, T_q, T_k] tensor.
-        if attn_mask.ndim == 2:
-          mask_5d = attn_mask[:, jnp.newaxis, jnp.newaxis, jnp.newaxis, :]
-        else:
-          mask_5d = attn_mask[:, jnp.newaxis, jnp.newaxis, :, :]
-        attn = jnp.where(mask_5d, attn, K_MASK)
+      if attn_mask is not None:
+        # 3-D mask [B, T_q, S]: explicit causal mask — safe to apply always
+        # (T_q == S at prefill; T_q == 1 at decode step).
+        # 2-D mask [B, S]: padding-only mask — skip when cache is present
+        # because T_q != S and the mask can't broadcast.
+        apply_mask = (attn_mask.ndim == 3) or (cache is None)
+        if apply_mask:
+          if attn_mask.ndim == 2:
+            mask_5d = attn_mask[:, jnp.newaxis, jnp.newaxis, jnp.newaxis, :]
+          else:
+            mask_5d = attn_mask[:, jnp.newaxis, jnp.newaxis, :, :]
+          attn = jnp.where(mask_5d, attn, K_MASK)
       attn = jax.nn.softmax(attn.astype(jnp.float32), axis=-1).astype(
           key_proj.dtype
       )
@@ -1078,15 +1080,30 @@ class Qwen3_5(BackendMappingMixin, nnx.Module):
       cache: Cache | None,
       attention_mask: jaxtyping.Array,  # [B, L, L'] or [B, 1, L']
       output_hidden_states: bool = False,
+      input_embeddings: jaxtyping.Array | None = None,  # [B, L, D]
   ) -> tuple[jaxtyping.Array, Cache | None]:
     """Forward pass.
+
+    Args:
+      input_tokens: ``[B, L]`` token IDs.  Ignored when ``input_embeddings``
+        is supplied.
+      positions: ``[B, L]`` absolute position indices.
+      cache: per-layer KV / conv / recurrent cache or ``None``.
+      attention_mask: ``[B, 1, L, S]`` or ``[B, L, S]`` bool mask.
+      output_hidden_states: if True, sow hidden states as an intermediate.
+      input_embeddings: optional ``[B, L, D]`` pre-computed embeddings.  When
+        set, the token embedding lookup is skipped.  This is used for VLM
+        inference to inject visual token embeddings at image-token positions.
 
     Returns:
       predicted_logits: [B, L, V]
       new_cache: updated cache dict, or None if no cache was provided.
     """
     new_cache = None if cache is None else {}
-    x = self.embedder.encode(input_tokens)
+    if input_embeddings is not None:
+      x = input_embeddings
+    else:
+      x = self.embedder.encode(input_tokens)
 
     for i, layer in enumerate(self.layers):
       layer_name = f'layer_{i}'
