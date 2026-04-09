@@ -339,7 +339,7 @@ def create_model_from_safe_tensors(
       AttributeError: If create_model_from_safe_tensors is not in the module.
   """
   naming_info = naming.ModelNaming(model_name=model_name)
-  if naming_info.model_family in ('gemma', 'gemma1p1', 'gemma2', 'gemma3'):
+  if naming_info.model_family in ('gemma', 'gemma1p1', 'gemma2', 'gemma3', 'gemma4'):
     params_module = get_model_module(model_name, ModelModule.PARAMS_SAFETENSORS)
   else:
     params_module = get_model_module(model_name, ModelModule.PARAMS)
@@ -446,6 +446,10 @@ class AutoModel:
             'Gemma 3 models are only supported from GCS or INTERNAL.'
             f' Specified model source: {model_source}'
         )
+    elif naming_info.model_family == 'gemma4':
+      # Gemma 4 is loaded via HuggingFace safetensors (no GCS checkpoint needed).
+      # Fall through to Case 2 (create_model_from_safe_tensors).
+      pass
     elif naming_info.model_family in ('gemma', 'gemma1p1', 'gemma2'):
       if model_source == ModelSource.KAGGLE:
         # Download model from Kaggle requires NNX conversion and can takes long.
