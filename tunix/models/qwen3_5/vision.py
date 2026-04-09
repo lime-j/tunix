@@ -418,20 +418,33 @@ class Qwen3_5VisionModel(nnx.Module):
         for _, h, w in grid_thw.tolist()
     )
     freq_table = self.rotary_pos_emb(max_hw)  # [max_hw, head_dim//4]
+    M = self.config.spatial_merge_size        # = 2
 
     all_emb = []
     for t, h, w in grid_thw.tolist():
       t, h, w = int(t), int(h), int(w)
-      # Build spatial position indices matching HF rot_pos_emb:
-      # HF uses merge_size-aware interleaving for the merger, but the
-      # per-token positions follow raster order after accounting for merge.
-      rows = jnp.repeat(jnp.arange(h), w)  # [h*w]
-      cols = jnp.tile(jnp.arange(w), h)    # [h*w]
-      row_freqs = freq_table[rows]          # [h*w, head_dim//4]
-      col_freqs = freq_table[cols]          # [h*w, head_dim//4]
-      # cat row and col → [h*w, head_dim//2]
+      # HF rot_pos_emb uses merge-size interleaved ordering:
+      #   merged grid: mH x mW, each cell is M x M full-res patches.
+      #   row_idx = block_row * M + intra_row  (similar for col)
+      # The nested loops produce: for each (block_r, block_c, intra_r, intra_c)
+      mH, mW = h // M, w // M
+      block_rows = jnp.arange(mH)   # [mH]
+      block_cols = jnp.arange(mW)   # [mW]
+      intra_row  = jnp.arange(M)    # [M]
+      intra_col  = jnp.arange(M)    # [M]
+      # Full row indices: [mH, mW, M, M]
+      row_idx = (block_rows[:, None, None, None] * M
+                 + intra_row[None, None, :, None])
+      col_idx = (block_cols[None, :, None, None] * M
+                 + intra_col[None, None, None, :])
+      # Broadcast to [mH, mW, M, M] and flatten to [h*w]
+      row_idx = jnp.broadcast_to(row_idx, (mH, mW, M, M)).reshape(-1)
+      col_idx = jnp.broadcast_to(col_idx, (mH, mW, M, M)).reshape(-1)
+
+      row_freqs = freq_table[row_idx]  # [h*w, head_dim//4]
+      col_freqs = freq_table[col_idx]  # [h*w, head_dim//4]
+      # cat row+col → [h*w, head_dim//2], then duplicate → [h*w, head_dim]
       emb = jnp.concatenate([row_freqs, col_freqs], axis=-1)
-      # duplicate → [h*w, head_dim]  (matches HF cat(emb, emb))
       emb = jnp.concatenate([emb, emb], axis=-1)
       if t > 1:
         emb = jnp.tile(emb, (t, 1))

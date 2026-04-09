@@ -32,6 +32,7 @@ import numpy as np
 import optax
 import orbax.checkpoint as ocp
 from tunix.perf import trace as trace_lib
+from tunix.perf.experimental import tracer as perf_tracer_v2
 from tunix.rl import rl_cluster as rl_cluster_lib
 from tunix.rl.grpo import grpo_learner as grpo_lib
 from tunix.rl.queue import data_queue as queue_lib
@@ -146,6 +147,7 @@ class GRPOLearnerTest(parameterized.TestCase):
         self.algo_config = grpo_config
         self._data_shuffle_seed = None
         self.rl_cluster = types.SimpleNamespace(
+            global_steps=0,
             cluster_config=types.SimpleNamespace(
                 training_config=types.SimpleNamespace(
                     rollout_micro_batch_size=1,
@@ -154,6 +156,7 @@ class GRPOLearnerTest(parameterized.TestCase):
             ),
             buffer_metrics=lambda x, mode: None,
             perf=trace_lib.NoopTracer(),
+            perf_v2=perf_tracer_v2.NoopTracer(),
         )
         self._rollout_micro_batch_size = 1
         self._compute_logps_micro_batch_size = 1

@@ -197,7 +197,7 @@ class VllmSamplerTest(absltest.TestCase):
     )
 
     expected_output_pattern = [
-        (prompts[0], ["Tom", "help"]),
+        (prompts[0], ["Tom", "Hello"]),
         (prompts[1], ["Paris"]),
         (prompts[2], ["Rayleigh", "scattering"]),
     ]

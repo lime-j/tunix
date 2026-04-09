@@ -556,7 +556,7 @@ class PeftTrainer:
 
   @property
   def _tqdm_train_metrics(self) -> list[str]:
-    return ["loss", "perplexity", "steps_per_sec", "learning_rate"]
+    return ["loss", "perplexity", "learning_rate"]
 
   def _may_update_pbar(
       self,

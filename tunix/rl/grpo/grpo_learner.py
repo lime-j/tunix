@@ -25,6 +25,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from tunix.generate import utils
+from tunix.perf.experimental import constants as perf_constants
 from tunix.rl import algorithm_config as algo_config_lib
 from tunix.rl import common
 from tunix.rl import function_registry
@@ -216,12 +217,19 @@ class GRPOLearner(rl_learner.RLLearner[TGrpoConfig]):
     training_input["prompts"] = list(training_input["prompts"])
     pad_value = self.rl_cluster.rollout.pad_id()
     eos_value = self.rl_cluster.rollout.eos_id()
+
+    # TODO (noghabi): Add mini batch and micro batch tags
+    perf_tags = {
+        perf_constants.STEP: self.rl_cluster.global_steps,
+    }
+
     rollout_output = self.rl_cluster.generate(
         prompts=training_input["prompts"],
         mode=mode,
         micro_batch_size=(
             self._rollout_micro_batch_size * self.algo_config.num_generations
         ),
+        trace_tags=perf_tags,
     )
     padded_completion_ids = np.array([
         utils.pad_to_length(
@@ -245,7 +253,11 @@ class GRPOLearner(rl_learner.RLLearner[TGrpoConfig]):
     if self.algo_config.beta != 0.0:
       devices = self.rl_cluster.r2m[rl_cluster_lib.Role.REFERENCE].devices
       # TODO(yangmu): use function decorator to trace this part, same below.
-      with self.rl_cluster.perf.span("refer_inference", devices) as interval:
+      with self.rl_cluster.perf.span(
+          "refer_inference", devices
+      ) as interval, self.rl_cluster.perf_v2.span(
+          perf_constants.REFERENCE_INFERENCE, devices, tags=perf_tags
+      ) as interval_v2:
         ref_per_token_logps = self.rl_cluster.get_ref_per_token_logps(
             prompt_tokens=prompt_ids,
             completion_tokens=jax_completion_ids,
@@ -257,13 +269,16 @@ class GRPOLearner(rl_learner.RLLearner[TGrpoConfig]):
             ),
         )
         interval.device_end([ref_per_token_logps])
+        interval_v2.async_end([ref_per_token_logps])
     else:
       ref_per_token_logps = None
     if self.algo_config.num_iterations > 1:
       devices = self.rl_cluster.r2m[rl_cluster_lib.Role.ACTOR].devices
       with self.rl_cluster.perf.span(
           "old_actor_inference", devices
-      ) as interval:
+      ) as interval, self.rl_cluster.perf_v2.span(
+          perf_constants.OLD_ACTOR_INFERENCE, devices, tags=perf_tags
+      ) as interval_v2:
         old_per_token_logps = self.rl_cluster.get_old_per_token_logps(
             prompt_tokens=prompt_ids,
             completion_tokens=jax_completion_ids,
@@ -273,10 +288,15 @@ class GRPOLearner(rl_learner.RLLearner[TGrpoConfig]):
             ),
         )
         interval.device_end([old_per_token_logps])
+        interval_v2.async_end([old_per_token_logps])
     else:
       old_per_token_logps = None
 
-    with self.rl_cluster.perf.span("advantage_computation"):
+    with self.rl_cluster.perf.span(
+        "advantage_computation"
+    ), self.rl_cluster.perf_v2.span(
+        perf_constants.ADVANTAGE_COMPUTATION, tags=perf_tags
+    ):
       # Compute rewards and advantages
       rewards = self._compute_rewards(
           prompts=training_input["prompts"],

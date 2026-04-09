@@ -9,11 +9,12 @@ set -euo pipefail
 #     ./run_remote_pw.sh
 
 CLUSTER_NAME=${CLUSTER_NAME:-tunix-v5p-16}
-
+REMOTE_PW_PORT=${REMOTE_PW_PORT:-8890}
 JOB_NAME=${JOB_NAME:-tunix-${USER}-${TPU_TYPE}-${TOPOLOGY}-pw-0}
 
 # cpu-np or cpu-np-large-mem-disk
 CPU_POOL_NAME=${CPU_POOL_NAME:-cpu-np}
+
 
 # https://docs.cloud.google.com/kubernetes-engine/docs/concepts/plan-tpus
 TPU_ARG=${TPU_TYPE:-v5p}
@@ -296,7 +297,7 @@ gcloud container clusters get-credentials $CLUSTER_NAME --zone $REGION
 
 kubectl get pods; kubectl delete pathwaysjob "$JOB_NAME" --ignore-not-found; until ! kubectl get pathwaysjob "$JOB_NAME" >/dev/null 2>&1; do      echo "waiting for pathwaysjob $JOB_NAME to be removed...";     sleep 5; done; kubectl delete jobset "$JOB_NAME" --ignore-not-found; until ! kubectl get jobset "$JOB_NAME" >/dev/null 2>&1; do      echo "waiting for jobset $JOB_NAME to be removed...";     sleep 5; done; kubectl apply -f jobset.yaml; until kubectl get pod | grep "$JOB_NAME-pathways-head-0-0" | grep -q Running; do     echo "waiting for head pod...";        sleep 5; done;
 
-python3 $GITHUB_PATH/experimental/pathways_dev/remote-ide.py -w "$JOB_NAME" -m "vscode" -b "$TEMP_BUCKET" -P 8890 --check-active-session
+python3 $GITHUB_PATH/experimental/pathways_dev/remote-ide.py -w "$JOB_NAME" -m "vscode" -b "$TEMP_BUCKET" -P $REMOTE_PW_PORT --check-active-session
 
 
 #

@@ -888,16 +888,16 @@ class RLCluster:
       else:
         rollout_config = self.cluster_config.rollout_config
 
-      base_tags = {
+      perf_tags = {
           perf_constants.ROLE: Role.ROLLOUT.value,
       }
       if trace_tags:
-        base_tags.update(trace_tags)
+        perf_tags.update(trace_tags)
 
       with self._perf.span("rollout", mesh.devices) as span, self._perf_v2.span(
           perf_constants.ROLLOUT,
           mesh.devices,
-          tags=base_tags,
+          tags=perf_tags,
       ) as span_v2:
         outputs = [
             self.rollout.generate(string_prompts[s], rollout_config)

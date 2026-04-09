@@ -1,3 +1,4 @@
+import dataclasses
 from unittest import mock
 
 from absl.testing import absltest
@@ -242,6 +243,49 @@ class AutoModelTest(parameterized.TestCase):
           model_source=model_source,
           model_path=None,
       )
+
+
+  @mock.patch.object(naming, "ModelNaming", autospec=True)
+  @mock.patch.object(automodel, "call_model_config", autospec=True)
+  @mock.patch.object(automodel, "download_model", autospec=True)
+  @mock.patch.object(automodel, "create_model_from_safe_tensors", autospec=True)
+  def test_from_pretrained_with_config_overrides(
+      self,
+      mock_create_model,
+      mock_download_model,
+      mock_call_model_config,
+      mock_model_naming,
+  ):
+    @dataclasses.dataclass
+    class FakeConfig:
+      use_flash_attention: bool = False
+      flash_attention_block_size: int = 1024
+
+    mock_naming_info = mock.Mock()
+    mock_naming_info.model_family = "qwen2"
+    mock_naming_info.model_name = "qwen2.5-0.5b"
+    mock_model_naming.return_value = mock_naming_info
+
+    mock_call_model_config.return_value = FakeConfig()
+    mock_download_model.return_value = "fake_path"
+    mesh = jax.sharding.Mesh(jax.devices(), ("devices",))
+
+    # Execution
+    automodel.AutoModel.from_pretrained(
+        model_id="qwen/Qwen2.5-0.5B",
+        mesh=mesh,
+        use_flash_attention=True,
+        flash_attention_block_size=512,
+        invalid_param="ignored",
+    )
+
+    # Verification
+    # check that create_model_from_safe_tensors was called with the overrides
+    self.assertTrue(mock_create_model.called)
+    called_config = mock_create_model.call_args[0][2]
+    self.assertTrue(called_config.use_flash_attention)
+    self.assertEqual(called_config.flash_attention_block_size, 512)
+    self.assertFalse(hasattr(called_config, "invalid_param"))
 
 
 if __name__ == "__main__":

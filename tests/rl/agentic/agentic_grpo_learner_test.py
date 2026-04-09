@@ -39,6 +39,7 @@ import numpy as np
 import optax
 import orbax.checkpoint as ocp
 from tunix.generate import tokenizer_adapter
+from tunix.rl import common as rl_common
 from tunix.rl import function_registry
 from tunix.rl import rl_cluster as rl_cluster_lib
 from tunix.rl.agentic import agentic_grpo_learner
@@ -455,12 +456,29 @@ class AgenticGrpoLearnerTest(parameterized.TestCase):
 
   def test_grpo_loss_fn_masks_zero_advantage_group(self):
     seq_len = 8
-    prompt_ids = jnp.ones((4, seq_len), dtype=jnp.int32)
+    prompt_ids = jnp.asarray(
+        [
+            [1] * seq_len,
+            [1] * seq_len,
+            [2] * seq_len,
+            [2] * seq_len,
+        ],
+        dtype=jnp.int32,
+    )
     completion_ids = jnp.ones((4, seq_len), dtype=jnp.int32)
     completion_mask = jnp.ones((4, seq_len), dtype=jnp.bool_)
-    # First group (2 samples) is degenerate and should be ignored.
-    advantages = jnp.asarray([0.0, 0.0, 1.0, -1.0], dtype=jnp.float32)
-    ref_per_token_logps = jnp.full((4, seq_len), -0.1, dtype=jnp.float32)
+    # Two prompts with two generations each.
+    # Prompt 1 has a non-degenerate advantage group; prompt 2 is degenerate.
+    advantages = jnp.asarray([-1.0, 1.0, 0.0, 0.0], dtype=jnp.float32)
+    ref_per_token_logps = jnp.asarray(
+        [
+            [-0.1] * seq_len,
+            [-0.1] * seq_len,
+            [-1.1] * seq_len,
+            [-1.1] * seq_len,
+        ],
+        dtype=jnp.float32,
+    )
 
     class MockModel(nnx.Module):
 
@@ -487,49 +505,71 @@ class AgenticGrpoLearnerTest(parameterized.TestCase):
         old_per_token_logps=None,
     )
 
-    valid_only_train_example = agentic_grpo_learner.TrainExample(
-        prompt_ids=prompt_ids[2:],
-        prompt_mask=(prompt_ids > -1)[2:],
-        completion_ids=completion_ids[2:],
-        completion_mask=completion_mask[2:],
-        ref_per_token_logps=ref_per_token_logps[2:],
-        advantages=advantages[2:],
-        old_per_token_logps=None,
-    )
-
-    algo_config = agentic_grpo_learner.GRPOConfig(
+    # config with disabled masking
+    no_masking_config = agentic_grpo_learner.GRPOConfig(
         beta=0.1,
         epsilon=0.2,
         num_generations=2,
         loss_algo="grpo",
         loss_agg_mode="token-mean",
+        degenerate_group_masking=False,
     )
+    # config with enabled masking (default)
+    masking_config = agentic_grpo_learner.GRPOConfig(
+        beta=0.1,
+        epsilon=0.2,
+        num_generations=2,
+        loss_algo="grpo",
+        loss_agg_mode="token-mean",
+        degenerate_group_masking=True,
+    )
+
     policy_loss_fn = function_registry.get_policy_loss_fn(
-        algo_config.policy_loss_fn
+        no_masking_config.policy_loss_fn
     )
 
     model = MockModel(rngs=nnx.Rngs(0))
-    full_loss, full_aux = policy_loss_fn(
+    no_masking_loss, _ = policy_loss_fn(
         model=model,
         train_example=train_example,
-        algo_config=algo_config,
+        algo_config=no_masking_config,
         pad_id=0,
         eos_id=2,
     )
-    valid_loss, valid_aux = policy_loss_fn(
+    masking_loss, _ = policy_loss_fn(
         model=model,
-        train_example=valid_only_train_example,
-        algo_config=algo_config,
+        train_example=train_example,
+        algo_config=masking_config,
         pad_id=0,
         eos_id=2,
     )
 
-    np.testing.assert_allclose(full_loss, valid_loss, rtol=1e-6, atol=1e-6)
+    # Expected values calculation:
+    # old_per_token_logps=None makes the importance ratio 1, so the policy
+    # term is simply -advantages. The mock model emits the same logit (0.1)
+    # for all 32 vocabulary entries, so softmax is uniform with probability
+    # 1/32 for every token and the selected per-token log-probability is
+    # log(1 / 32) = -log(32). We then derive the KL penalty from the full
+    # ref_per_token_logps tensor so each prompt group can have different KL.
+    per_token_logps = jnp.full(
+        completion_ids.shape,
+        -np.log(32.0),
+        dtype=jnp.float32,
+    )
+    per_token_kl = rl_common.compute_kl_divergence(
+        per_token_logps,
+        ref_per_token_logps,
+        no_masking_config.kl_loss_mode,
+    )
+    per_sequence_loss = -advantages + no_masking_config.beta * per_token_kl[:, 0]
+    expected_no_masking_loss = float(jnp.mean(per_sequence_loss))
+    expected_masking_loss = float(jnp.mean(per_sequence_loss[:2]))
+
     np.testing.assert_allclose(
-        full_aux["kl"], valid_aux["kl"], rtol=1e-6, atol=1e-6
+        no_masking_loss, expected_no_masking_loss, rtol=1e-6, atol=1e-6
     )
     np.testing.assert_allclose(
-        full_aux["entropy"], valid_aux["entropy"], rtol=1e-6, atol=1e-6
+        masking_loss, expected_masking_loss, rtol=1e-6, atol=1e-6
     )
 
   def test_checkpointing(self):
@@ -838,6 +878,114 @@ class AgenticGrpoLearnerTest(parameterized.TestCase):
     params1 = nnx.state(model_full, nnx.Param)
     params2 = nnx.state(model_resume, nnx.Param)
     jax.tree.map_with_path(test_common.assert_close, params1, params2)
+
+  @parameterized.named_parameters(
+      dict(
+          testcase_name="default_beta_zero",
+          beta=0.0,
+          force_compute_kl=False,
+          expect_ref_logps=False,
+      ),
+      dict(
+          testcase_name="force_kl_beta_zero",
+          beta=0.0,
+          force_compute_kl=True,
+          expect_ref_logps=True,
+      ),
+      dict(
+          testcase_name="beta_non_zero",
+          beta=0.1,
+          force_compute_kl=False,
+          expect_ref_logps=True,
+      ),
+  )
+  def test_force_compute_kl(self, beta, force_compute_kl, expect_ref_logps):
+    vocab = _mock_vocab()
+    tokenizer = tokenizer_adapter.TokenizerAdapter(vocab)
+    model = test_common.ToyTransformer(
+        config=test_common.ModelConfig(vocab_size=vocab.GetPieceSize()),
+        rngs=nnx.Rngs(0),
+    )
+    ref_model = test_common.ToyTransformer(
+        config=test_common.ModelConfig(vocab_size=vocab.GetPieceSize()),
+        rngs=nnx.Rngs(0),
+    )
+    mesh = pxla.thread_resources.env.physical_mesh
+    cluster_config = rl_cluster_lib.ClusterConfig(
+        role_to_mesh={
+            rl_cluster_lib.Role.ACTOR: mesh,
+            rl_cluster_lib.Role.REFERENCE: mesh,
+            rl_cluster_lib.Role.ROLLOUT: mesh,
+        },
+        rollout_engine="vanilla",
+        offload_to_cpu=False,
+        training_config=rl_cluster_lib.RLTrainingConfig(
+            actor_optimizer=optax.sgd(1e-3),
+            eval_every_n_steps=10,
+            max_steps=10,
+        ),
+        rollout_config=base_rollout.RolloutConfig(
+            max_prompt_length=32,
+            max_tokens_to_generate=10,
+            return_logprobs=True,
+        ),
+    )
+    rl_cluster = rl_cluster_lib.RLCluster(
+        actor=model,
+        reference=ref_model,
+        tokenizer=tokenizer,
+        cluster_config=cluster_config,
+    )
+
+    grpo_config = agentic_grpo_learner.GRPOConfig(
+        beta=beta,
+        force_compute_kl=force_compute_kl,
+        max_response_length=10,
+        num_generations=2,
+        num_iterations=1,
+    )
+    learner = agentic_grpo_learner.GRPOLearner(
+        rl_cluster=rl_cluster,
+        reward_fns=reward_fn_1,
+        algo_config=grpo_config,
+        chat_parser=MockChatParser(),
+    )
+
+    # Mock trajectories to pass into _process_results
+    class MockTraj:
+
+      def __init__(self, index):
+        self.traj = {
+            "conversation_text": [
+                {"role": "assistant", "content": f"msg {index}"}
+            ],
+            "conversation_tokens": np.array([1, 2, 3]),
+            "conversation_masks": np.array([1, 1, 1]),
+            "old_logprobs": None,
+            "policy_version": 0,
+            "trajectory_reward": 1.0,
+            "prompt_tokens": np.array([4, 5]),
+            "original_input": {"prompts": "hello"},
+            "group_id": "test_group",
+        }
+
+    trajectories = [MockTraj(0), MockTraj(1)]
+
+    with mock.patch.object(
+        rl_cluster,
+        "get_ref_per_token_logps",
+        return_value=jnp.zeros((2, 10)),
+    ) as mock_get_ref:
+      results = learner._process_results(trajectories, expected_step=1)
+      self.assertLen(results, 1)
+      train_example = results[0]
+
+      if expect_ref_logps:
+        mock_get_ref.assert_called_once()
+        self.assertIsNotNone(train_example.ref_per_token_logps)
+      else:
+        mock_get_ref.assert_not_called()
+        self.assertIsNone(train_example.ref_per_token_logps)
 
   def test_exception_handling(self):
     vocab = test_common.MockVocab()

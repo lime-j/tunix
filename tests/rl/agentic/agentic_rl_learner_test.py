@@ -18,7 +18,6 @@ from unittest import mock
 
 from absl.testing import absltest
 from absl.testing import parameterized
-from tunix.rl import rl_cluster as rl_cluster_lib
 from tunix.rl.agentic import agentic_rl_learner
 from tunix.rl.rollout import base_rollout
 
@@ -32,17 +31,18 @@ class AgenticRLLearnerTest(parameterized.TestCase):
   def test_validate_rollout_config_mismatch_max_tokens(self):
     rl_cluster = mock.Mock()
     rl_cluster.cluster_config = mock.Mock()
+    rl_cluster.cluster_config.rollout_engine = "generic"
     rollout_config = base_rollout.RolloutConfig(
         max_prompt_length=32,
         max_tokens_to_generate=10,
         return_logprobs=True,
     )
     rl_cluster.cluster_config.rollout_config = rollout_config
-    
+
     algo_config = agentic_rl_learner.AgenticRLConfig(
         max_response_length=20,  # Mismatch: 10 != 20
     )
-    
+
     with self.assertRaisesRegex(
         ValueError, r"max_tokens_to_generate \(10\) must match AgenticRLConfig max_response_length \(20\)"
     ):
@@ -55,17 +55,18 @@ class AgenticRLLearnerTest(parameterized.TestCase):
   def test_validate_rollout_config_missing_logprobs(self):
     rl_cluster = mock.Mock()
     rl_cluster.cluster_config = mock.Mock()
+    rl_cluster.cluster_config.rollout_engine = "generic"
     rollout_config = base_rollout.RolloutConfig(
         max_prompt_length=32,
         max_tokens_to_generate=10,
         return_logprobs=False,  # Should be True
     )
     rl_cluster.cluster_config.rollout_config = rollout_config
-    
+
     algo_config = agentic_rl_learner.AgenticRLConfig(
         max_response_length=10,
     )
-    
+
     with self.assertRaisesRegex(
         ValueError, r"must have return_logprobs=True"
     ):
@@ -78,6 +79,7 @@ class AgenticRLLearnerTest(parameterized.TestCase):
   def test_validate_rollout_config_dict_mode(self):
     rl_cluster = mock.Mock()
     rl_cluster.cluster_config = mock.Mock()
+    rl_cluster.cluster_config.rollout_engine = "generic"
     rollout_config_train = base_rollout.RolloutConfig(
         max_prompt_length=32,
         max_tokens_to_generate=10,
@@ -92,13 +94,40 @@ class AgenticRLLearnerTest(parameterized.TestCase):
         "train": rollout_config_train,
         "eval": rollout_config_eval,
     }
-    
+
     algo_config = agentic_rl_learner.AgenticRLConfig(
         max_response_length=10,
     )
-    
+
     with self.assertRaisesRegex(
         ValueError, r"RolloutConfig \(eval\) must have return_logprobs=True"
+    ):
+      DummyLearner(
+          rl_cluster=rl_cluster,
+          reward_fns=mock.Mock(),
+          algo_config=algo_config,
+      )
+
+  def test_validate_rollout_config_vllm_missing_server_mode(self):
+    rl_cluster = mock.Mock()
+    rl_cluster.cluster_config = mock.Mock()
+    rl_cluster.cluster_config.rollout_engine = "vllm"
+    rollout_config = base_rollout.RolloutConfig(
+        max_prompt_length=32,
+        max_tokens_to_generate=10,
+        return_logprobs=True,
+        rollout_vllm_server_mode=False,  # Should be True for vLLM
+    )
+    rl_cluster.cluster_config.rollout_config = rollout_config
+
+    algo_config = agentic_rl_learner.AgenticRLConfig(
+        max_response_length=10,
+    )
+
+    with self.assertRaisesRegex(
+        ValueError,
+        r"must have rollout_vllm_server_mode set to True for AgenticRLLearner"
+        r" if using vLLM engine",
     ):
       DummyLearner(
           rl_cluster=rl_cluster,

@@ -256,6 +256,15 @@ class AgenticRLLearner(abc.ABC, Generic[TConfig]):
             f"RolloutConfig ({mode}) must have return_logprobs=True for "
             "AgenticRLLearner. Please set this before initializing RLCluster."
         )
+      if (
+          self.rl_cluster.cluster_config.rollout_engine == "vllm"
+          and not config.rollout_vllm_server_mode
+      ):
+        raise ValueError(
+            f"RolloutConfig ({mode}) must have rollout_vllm_server_mode set to "
+            "True for AgenticRLLearner if using vLLM engine. Please set this "
+            "before initializing RLCluster."
+        )
 
   def _compute_rewards(
       self,
