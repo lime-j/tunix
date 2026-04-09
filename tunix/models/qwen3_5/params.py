@@ -233,6 +233,52 @@ def create_model_from_safe_tensors(
   )
 
 
+def create_vision_model_from_safe_tensors(
+    file_dir: str,
+    config: vision_lib.VisionConfig,
+    mesh: jax.sharding.Mesh | None = None,
+    dtype: jnp.dtype | None = None,
+) -> vision_lib.Qwen3_5VisionModel:
+  """Load vision encoder weights from the safetensors file.
+
+  Handles the ``reshape_conv3d`` special transform for the patch-embed kernel:
+  HF stores it as [out_ch=768, in_ch=3, T=2, H=16, W=16]; we reshape to
+  [1536, 768] to match the ``nnx.Linear`` kernel layout [in_features, out_features].
+  """
+  def _preprocess_fn(loaded: dict) -> dict:
+    key = 'patch_embed.proj.kernel'
+    if key in loaded:
+      w = loaded[key]
+      # HF Conv3d: [768, 3, 2, 16, 16] → transpose → [3,2,16,16,768] → flatten → [1536, 768]
+      # The mapping already transposed via ((1,0), None), giving [3*2*16*16, 768] = [1536, 768]
+      # but safetensors_loader applies (perm, reshape); here transform='reshape_conv3d'
+      # means we need to do it manually because the loader can't handle the 5D→2D case.
+      # At this point the array is [768, 3, 2, 16, 16] (raw, before any transform).
+      loaded[key] = w.reshape(768, -1).T  # [1536, 768]
+    return loaded
+
+  # Build a wrapped key_mapping that replaces 'reshape_conv3d' tags with
+  # a normal None transform (the actual reshape is done in preprocess_fn).
+  raw_map = _get_vision_key_mapping()
+
+  def _key_mapping(_cfg):
+    result = {}
+    for pattern, (tunix_key, transform) in raw_map.items():
+      result[pattern] = (tunix_key, None if transform == 'reshape_conv3d' else transform)
+    return result
+
+  return safetensors_loader.load_and_create_model(
+      file_dir=file_dir,
+      model_class=vision_lib.Qwen3_5VisionModel,
+      config=config,
+      key_mapping=_key_mapping,
+      mesh=mesh,
+      dtype=dtype,
+      preprocess_fn=_preprocess_fn,
+      mode='optimized',
+  )
+
+
 def _qwen3_5_state_key_to_safetensors_key(lora_name: str) -> str:
   """Transform tunix layer path to HF safetensors state dict key."""
   key = f'model.{lora_name}.weight'
