@@ -68,18 +68,27 @@ def _build_causal_mask_np(T: int, cache_size: int) -> np.ndarray:
 # Prefill benchmark
 # ---------------------------------------------------------------------------
 
-def make_prefill_fn(lm_model):
-    @jax.jit
-    def prefill(tokens, positions, attn_mask, cache):
-        return lm_model(
-            input_tokens=tokens, positions=positions,
-            cache=cache, attention_mask=attn_mask,
-        )
+def make_prefill_fn(lm_model, mesh=None):
+    if mesh is not None:
+        @jax.jit
+        def prefill(tokens, positions, attn_mask, cache):
+            with mesh:
+                return lm_model(
+                    input_tokens=tokens, positions=positions,
+                    cache=cache, attention_mask=attn_mask,
+                )
+    else:
+        @jax.jit
+        def prefill(tokens, positions, attn_mask, cache):
+            return lm_model(
+                input_tokens=tokens, positions=positions,
+                cache=cache, attention_mask=attn_mask,
+            )
     return prefill
 
 
 def bench_prefill(lm_model, batch_size: int, prompt_len: int,
-                  dtype, n_warmup: int, n_iters: int) -> float:
+                  dtype, n_warmup: int, n_iters: int, mesh=None) -> float:
     """Returns mean prefill throughput in tokens/sec (batch * prompt_len / sec)."""
     T_pad      = _next_pow2(prompt_len)
     cache_size = T_pad + 4  # minimal cache for prefill-only
@@ -93,7 +102,7 @@ def bench_prefill(lm_model, batch_size: int, prompt_len: int,
     attn_mask = jnp.broadcast_to(jnp.array(mask_np), (batch_size, T_pad, cache_size))
     cache     = lm_model.init_cache(batch_size=batch_size, cache_size=cache_size, dtype=dtype)
 
-    prefill_fn = make_prefill_fn(lm_model)
+    prefill_fn = make_prefill_fn(lm_model, mesh)
 
     # Warmup (triggers XLA compilation)
     for _ in range(n_warmup):
@@ -116,46 +125,57 @@ def bench_prefill(lm_model, batch_size: int, prompt_len: int,
 # Decode benchmark  (lax.scan over decode_steps, batch_size >= 1)
 # ---------------------------------------------------------------------------
 
-def make_scan_decode_fn(lm_model, T_pad: int, decode_steps: int, batch_size: int):
-    """JIT-compiled batched lax.scan decode.
-
-    Carry: (cache, dec_mask [B,1,S], last_tokens [B])
-    Output per step: next_tokens [B]
-    """
-    @jax.jit
-    def run(first_tokens, cache, dec_mask):
-        def body(carry, step):
-            cache, dec_mask, last_tokens = carry
-            pos     = T_pad + step                                       # scalar
-            toks    = last_tokens[:, None]                               # [B, 1]
-            pos_arr = jnp.full((batch_size, 1), pos, dtype=jnp.int32)   # [B, 1]
-            # Mark position as valid for all sequences
-            update  = jnp.ones((batch_size, 1, 1), dtype=jnp.bool_)
-            dec_mask = jax.lax.dynamic_update_slice(
-                dec_mask, update, (0, 0, pos)
-            )
-            logits, new_cache = lm_model(
-                input_tokens=toks, positions=pos_arr,
-                cache=cache, attention_mask=dec_mask,
-            )
-            next_toks = jnp.argmax(logits[:, 0, :], axis=-1).astype(jnp.int32)  # [B]
-            return (new_cache, dec_mask, next_toks), next_toks
-
-        steps = jnp.arange(decode_steps, dtype=jnp.int32)
-        init  = (cache, dec_mask, first_tokens)
-        (_, _, _), all_tokens = jax.lax.scan(body, init, steps)
-        return all_tokens  # [decode_steps, B]
-
+def make_scan_decode_fn(lm_model, T_pad: int, decode_steps: int, batch_size: int,
+                        mesh=None):
+    """JIT-compiled batched lax.scan decode."""
+    if mesh is not None:
+        @jax.jit
+        def run(first_tokens, cache, dec_mask):
+            def body(carry, step):
+                cache, dec_mask, last_tokens = carry
+                pos     = T_pad + step
+                toks    = last_tokens[:, None]
+                pos_arr = jnp.full((batch_size, 1), pos, dtype=jnp.int32)
+                update  = jnp.ones((batch_size, 1, 1), dtype=jnp.bool_)
+                dec_mask = jax.lax.dynamic_update_slice(dec_mask, update, (0, 0, pos))
+                with mesh:
+                    logits, new_cache = lm_model(
+                        input_tokens=toks, positions=pos_arr,
+                        cache=cache, attention_mask=dec_mask,
+                    )
+                next_toks = jnp.argmax(logits[:, 0, :], axis=-1).astype(jnp.int32)
+                return (new_cache, dec_mask, next_toks), next_toks
+            steps = jnp.arange(decode_steps, dtype=jnp.int32)
+            (_, _, _), all_tokens = jax.lax.scan(body, (cache, dec_mask, first_tokens), steps)
+            return all_tokens
+    else:
+        @jax.jit
+        def run(first_tokens, cache, dec_mask):
+            def body(carry, step):
+                cache, dec_mask, last_tokens = carry
+                pos     = T_pad + step
+                toks    = last_tokens[:, None]
+                pos_arr = jnp.full((batch_size, 1), pos, dtype=jnp.int32)
+                update  = jnp.ones((batch_size, 1, 1), dtype=jnp.bool_)
+                dec_mask = jax.lax.dynamic_update_slice(dec_mask, update, (0, 0, pos))
+                logits, new_cache = lm_model(
+                    input_tokens=toks, positions=pos_arr,
+                    cache=cache, attention_mask=dec_mask,
+                )
+                next_toks = jnp.argmax(logits[:, 0, :], axis=-1).astype(jnp.int32)
+                return (new_cache, dec_mask, next_toks), next_toks
+            steps = jnp.arange(decode_steps, dtype=jnp.int32)
+            (_, _, _), all_tokens = jax.lax.scan(body, (cache, dec_mask, first_tokens), steps)
+            return all_tokens
     return run
 
 
 def bench_decode(lm_model, batch_size: int, prompt_len: int, decode_steps: int,
-                 dtype, n_warmup: int, n_iters: int) -> float:
+                 dtype, n_warmup: int, n_iters: int, mesh=None) -> float:
     """Returns mean decode throughput in tokens/sec (batch * decode_steps / sec)."""
     T_pad      = _next_pow2(prompt_len)
     cache_size = T_pad + decode_steps + 4
 
-    # Run a quick prefill to get a warm cache, then benchmark decode from that.
     tokens    = jnp.ones((batch_size, T_pad), dtype=jnp.int32)
     positions = jnp.broadcast_to(
         jnp.arange(T_pad, dtype=jnp.int32)[None], (batch_size, T_pad)
@@ -163,29 +183,26 @@ def bench_decode(lm_model, batch_size: int, prompt_len: int, decode_steps: int,
     mask_np   = _build_causal_mask_np(T_pad, cache_size)
     attn_mask = jnp.broadcast_to(jnp.array(mask_np), (batch_size, T_pad, cache_size))
 
-    prefill_fn     = make_prefill_fn(lm_model)
-    scan_decode_fn = make_scan_decode_fn(lm_model, T_pad, decode_steps, batch_size)
+    prefill_fn     = make_prefill_fn(lm_model, mesh)
+    scan_decode_fn = make_scan_decode_fn(lm_model, T_pad, decode_steps, batch_size, mesh)
 
     def _prefill_and_decode():
         cache = lm_model.init_cache(batch_size=batch_size, cache_size=cache_size, dtype=dtype)
         logits, cache = prefill_fn(tokens, positions, attn_mask, cache)
         first_tokens  = jnp.argmax(logits[:, prompt_len - 1, :], axis=-1).astype(jnp.int32)
-        # Initial decode mask: prefill positions are valid
         dec_mask = jnp.zeros((batch_size, 1, cache_size), dtype=jnp.bool_)
         dec_mask = dec_mask.at[:, 0, :prompt_len].set(True)
         return first_tokens, cache, dec_mask
 
-    # Warmup (JIT compilation happens here)
     for _ in range(n_warmup):
         first_tokens, cache, dec_mask = _prefill_and_decode()
         out = scan_decode_fn(first_tokens, cache, dec_mask)
         out.block_until_ready()
 
-    # Timed iterations — time only the decode scan, not prefill
     times = []
     for _ in range(n_iters):
         first_tokens, cache, dec_mask = _prefill_and_decode()
-        jax.effects_barrier()  # flush any async prefill work
+        jax.effects_barrier()
         t0  = time.perf_counter()
         out = scan_decode_fn(first_tokens, cache, dec_mask)
         out.block_until_ready()
@@ -246,8 +263,11 @@ def main():
         print(f'Flash attention ON (block={args.flash_block_size}, mesh={mesh.shape})')
     else:
         mesh = None
+    # NOTE: do NOT pass mesh to create_model_from_safe_tensors — weight sharding
+    # with a 4-way TP mesh fails for small-dim weights (e.g. conv1d shape (C,2,K)).
+    # Instead the mesh is activated per-call inside make_prefill_fn / make_scan_decode_fn.
     lm = qwen_params.create_model_from_safe_tensors(
-        file_dir=args.ckpt_dir, config=cfg, mesh=mesh, dtype=dtype,
+        file_dir=args.ckpt_dir, config=cfg, dtype=dtype,
     )
     print(f'Model loaded. Devices: {jax.devices()}\n')
 
@@ -267,7 +287,8 @@ def main():
 
             # Prefill
             try:
-                pre_tps = bench_prefill(lm, bs, pl, dtype, args.n_warmup, args.n_iters)
+                pre_tps = bench_prefill(lm, bs, pl, dtype, args.n_warmup, args.n_iters,
+                                        mesh=mesh)
                 row += f" {pre_tps:>{COL}.1f}"
             except Exception as e:
                 row += f" {'ERR':>{COL}}"
@@ -277,7 +298,8 @@ def main():
             if not args.prefill_only:
                 try:
                     dec_tps = bench_decode(
-                        lm, bs, pl, args.decode_steps, dtype, args.n_warmup, args.n_iters
+                        lm, bs, pl, args.decode_steps, dtype, args.n_warmup, args.n_iters,
+                        mesh=mesh,
                     )
                     row += f" {dec_tps:>{COL}.1f} {args.decode_steps:>{COL}}"
                 except Exception as e:
