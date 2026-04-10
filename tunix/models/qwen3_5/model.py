@@ -636,7 +636,10 @@ class Attention(nnx.Module):
           q_seq_shards=q_seq_shards,
       )
       shd_spec = P(shd_b, shd_n, shd_t, shd_h)
-      unsharded_seq = P(shd_b, shd_n, None, shd_h)
+      # KV head axis may not be divisible by head_shards (GQA: num_kv_heads < num_q_heads).
+      # Replicate KV heads across TP when num_kv_heads % head_shards != 0.
+      kv_head_shard = shd_n if (head_shards > 1 and kh % head_shards == 0) else None
+      kv_spec = P(shd_b, kv_head_shard, None, shd_h)
       kernel_spec = splash_attn_kernel.manual_sharding_spec(
           shd.NamedSharding(mesh, P(shd_n, shd_t))
       )
@@ -646,7 +649,7 @@ class Attention(nnx.Module):
               q_block, k_block, v_block
           ),
           mesh,
-          in_specs=(kernel_spec, shd_spec, unsharded_seq, unsharded_seq),
+          in_specs=(kernel_spec, shd_spec, kv_spec, kv_spec),
           out_specs=shd_spec,
           check_rep=False,
       )
