@@ -373,18 +373,22 @@ def main():
     lm_cfg.use_flash_attention = True
     lm_cfg.flash_attention_block_size = args.flash_block_size
     # Splash Attention needs a mesh with a 'tp' axis for shard_map.
-    # Create a simple 1-D TP mesh over all available devices.
     mesh = jax.sharding.Mesh(
         np.array(jax.devices()).reshape(1, -1, 1, 1),
         axis_names=('fsdp', 'tp', 'sp', 'expert'),
     )
+    # Replicate weights so all 4 devices participate; avoids TP divisibility
+    # errors from GQA (num_kv_heads=2 not divisible by tp=4).
+    lm_cfg.shd_config = qwen_model.ShardingConfig.get_replicated_sharding()
     print(f'     Flash attention ON  (block={args.flash_block_size}, mesh={mesh.shape})')
+    print(f'     Weights replicated across {len(jax.devices())} devices')
   else:
     mesh = None
+  # Do NOT pass mesh= to the loader — mesh is only activated inside @jax.jit
+  # via `with mesh:` so Splash Attention can find it through thread resources.
   lm = qwen_params.create_model_from_safe_tensors(
       file_dir=args.ckpt_dir,
       config=lm_cfg,
-      mesh=mesh,
       dtype=dtype,
   )
   print(f'     LM loaded. Params: '

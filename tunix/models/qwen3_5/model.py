@@ -118,6 +118,31 @@ class ShardingConfig:
         linear_weight_dd=(fsdp, None),
     )
 
+  @staticmethod
+  def get_replicated_sharding() -> 'ShardingConfig':
+    """All weights replicated across all devices (no partitioning).
+
+    Use this when you want all N devices to hold a full copy of the model
+    (e.g. flash-attention-only parallelism via Splash Attention's shard_map)
+    without the divisibility constraints imposed by TP weight sharding.
+    Each device participates in computation but stores the full model.
+    """
+    none = (None,)
+    return ShardingConfig(
+        emb_vd=(None, None),
+        emb_dv=(None, None),
+        q_weight_dnh=(None, None, None),
+        kv_weight_dnh=(None, None, None),
+        o_weight_nhd=(None, None, None),
+        ffw_weight_df=(None, None),
+        ffw_weight_fd=(None, None),
+        rms_norm_weight=(None,),
+        act_btd=(None, None, None),
+        act_btf=(None, None, None),
+        act_btnh=(None, None, None, None),
+        linear_weight_dd=(None, None),
+    )
+
 
 @dataclasses.dataclass(slots=True)
 class ModelConfig:

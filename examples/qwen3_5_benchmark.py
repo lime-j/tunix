@@ -260,7 +260,12 @@ def main():
             np.array(jax.devices()).reshape(1, -1, 1, 1),
             axis_names=('fsdp', 'tp', 'sp', 'expert'),
         )
+        # Replicate all weights across devices (avoids TP divisibility errors
+        # from GQA: num_kv_heads=2 not divisible by tp=4).
+        # All 4 devices hold the full model and participate in Splash Attention.
+        cfg.shd_config = qwen_model.ShardingConfig.get_replicated_sharding()
         print(f'Flash attention ON (block={args.flash_block_size}, mesh={mesh.shape})')
+        print(f'  Weights: replicated across all {len(jax.devices())} devices')
     else:
         mesh = None
     # NOTE: do NOT pass mesh to create_model_from_safe_tensors — weight sharding
