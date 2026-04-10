@@ -594,7 +594,10 @@ class Attention(nnx.Module):
     _, _, qh, d = query_proj.shape
     _, _, kh, _ = key_proj.shape
 
-    if self.config.use_flash_attention and t > 1:
+    if (self.config.use_flash_attention
+        and t > 256                                        # Splash Attention minimum
+        and t >= self.config.flash_attention_block_size):  # must fit at least one block
+
       # Splash attention (TPU flash attention)
       query_proj = query_proj.transpose(0, 2, 1, 3)
       key_proj = key_proj.transpose(0, 2, 1, 3)

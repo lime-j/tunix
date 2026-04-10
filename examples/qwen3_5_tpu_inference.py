@@ -340,6 +340,11 @@ def main():
   parser.add_argument('--dtype', default='bfloat16',
                       choices=['float32', 'bfloat16'],
                       help='Model weight dtype')
+  parser.add_argument('--flash_attention', action='store_true',
+                      help='Enable Pallas Splash Attention (TPU flash attention) '
+                           'for prefill. Requires a mesh; uses all available devices.')
+  parser.add_argument('--flash_block_size', type=int, default=512,
+                      help='Block size for Splash Attention (default 512)')
   parser.add_argument('--jax_cache_dir', default=_DEFAULT_JAX_CACHE,
                       help='Directory for JAX persistent compilation cache '
                            '(set to empty string "" to disable)')
@@ -364,9 +369,22 @@ def main():
   print(f'[2] Loading LM from {args.ckpt_dir} (dtype={args.dtype})...')
   lm_cfg = qwen_model.ModelConfig.qwen3_5_0p8b()
   lm_cfg.dtype = dtype
+  if args.flash_attention:
+    lm_cfg.use_flash_attention = True
+    lm_cfg.flash_attention_block_size = args.flash_block_size
+    # Splash Attention needs a mesh with a 'tp' axis for shard_map.
+    # Create a simple 1-D TP mesh over all available devices.
+    mesh = jax.sharding.Mesh(
+        np.array(jax.devices()).reshape(1, -1, 1, 1),
+        axis_names=('fsdp', 'tp', 'sp', 'expert'),
+    )
+    print(f'     Flash attention ON  (block={args.flash_block_size}, mesh={mesh.shape})')
+  else:
+    mesh = None
   lm = qwen_params.create_model_from_safe_tensors(
       file_dir=args.ckpt_dir,
       config=lm_cfg,
+      mesh=mesh,
       dtype=dtype,
   )
   print(f'     LM loaded. Params: '
