@@ -70,16 +70,18 @@ def to_np_dtype(dtype):
 
 
 def load_safetensors_with_offsets(filepath):
-  """Loads safetensors file and returns tensor metadata with offsets.
+  """Loads safetensors file and returns tensor metadata with byte offsets.
+
+  Supports files with mixed dtypes (e.g. BF16 weights alongside F32 scalars).
 
   Args:
     filepath: The path to the safetensors file.
 
   Returns:
     A tuple containing:
-      - contiguous_array: A numpy array containing the concatenated tensor data.
-      - tensor_metadata: A list of dictionaries, each containing metadata
-        (name, offset_elements, size_elements, shape, dtype) for a tensor.
+      - raw_bytes: A numpy uint8 array of the raw data block (zero-copy mmap).
+      - tensor_metadata: A list of dicts with keys:
+          name, start_byte, end_byte, shape, dtype.
       - mm: The mmap object used to read the file.
       - f: The file handle.
   """
@@ -93,48 +95,33 @@ def load_safetensors_with_offsets(filepath):
 
   tensor_metadata = []
 
-  itemsize = 2  # Default to bfloat16
-  common_dtype = None
   for tensor_name, metadata in header.items():
     if tensor_name == '__metadata__':
       continue
 
     dtype = metadata['dtype']
-    if common_dtype is None:
-      common_dtype = dtype
-      np_type = to_np_dtype(dtype)
-      itemsize = np.dtype(np_type).itemsize
-
     start_byte, end_byte = metadata['data_offsets']
     shape = tuple(metadata['shape'])
 
-    size_bytes = end_byte - start_byte
-    size_elements = size_bytes // itemsize
-    offset_elements = start_byte // itemsize
-
     tensor_metadata.append({
         'name': tensor_name,
-        'offset_elements': offset_elements,
-        'size_elements': size_elements,
+        'start_byte': start_byte,
+        'end_byte': end_byte,
         'shape': shape,
         'dtype': dtype,
     })
 
-  file_size = os.path.getsize(filepath)
-  data_size_bytes = file_size - data_block_start_offset_bytes
-  total_elements = data_size_bytes // itemsize
-
   f = open(filepath, 'rb')
-
   mm = mmap.mmap(f.fileno(), 0, prot=mmap.PROT_READ)
-  contiguous_array = np.frombuffer(
+  # Raw uint8 view of the data block (zero-copy); individual tensors are
+  # extracted per-dtype in load_and_create_model_opt.
+  raw_bytes = np.frombuffer(
       mm,
-      dtype=to_np_dtype(common_dtype),
-      count=total_elements,
+      dtype=np.uint8,
       offset=data_block_start_offset_bytes,
   )
 
-  return contiguous_array, tensor_metadata, mm, f
+  return raw_bytes, tensor_metadata, mm, f
 
 
 def load_and_create_model_orig(
@@ -355,7 +342,7 @@ def load_and_create_model_opt(
 
   state_dict = {}
   skipped_keys = []
-  for array, metadata_list in arrays:
+  for raw_bytes, metadata_list in arrays:
     for metadata in metadata_list:
       try:
         jax_key_mapped, transform = torch_key_to_jax_key(
@@ -364,10 +351,18 @@ def load_and_create_model_opt(
       except ValueError:
         skipped_keys.append(metadata['name'])
         continue
-      parameter = array[
-          metadata['offset_elements'] : metadata['offset_elements']
-          + metadata['size_elements']
-      ].reshape(metadata['shape'])
+      # Use per-tensor dtype so mixed-dtype files (e.g. F32 + BF16) are
+      # handled correctly.  The byte offsets are relative to the data block
+      # start (raw_bytes[0] == byte 0 of the data block).
+      np_dtype = to_np_dtype(metadata['dtype'])
+      itemsize = np.dtype(np_dtype).itemsize
+      start_byte = metadata['start_byte']
+      end_byte = metadata['end_byte']
+      parameter = (
+          raw_bytes[start_byte:end_byte]
+          .view(np_dtype)
+          .reshape(metadata['shape'])
+      )
       if transform is not None:
         permute, reshape = transform
         if permute:

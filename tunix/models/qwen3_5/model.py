@@ -790,7 +790,7 @@ class GatedDeltaNet(nnx.Module):
   ) -> tuple[jaxtyping.Array, jaxtyping.Array]:
     """Depthwise causal conv1d."""
     # weight is already [C, 1, K] = OIH layout for JAX depthwise conv
-    kernel = self.conv1d_weight.value
+    kernel = self.conv1d_weight.value.astype(x.dtype)
     seq_len = x.shape[-1]
 
     if conv_state is None:

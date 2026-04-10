@@ -369,7 +369,7 @@ class Qwen3_5VisionModel(nnx.Module):
     head_dim = config.hidden_size // config.num_heads
     self.rotary_pos_emb = VisionRotaryEmbedding(head_dim // 2)
 
-    self.blocks = [VisionBlock(config, rngs=rngs) for _ in range(config.depth)]
+    self.blocks = nnx.List([VisionBlock(config, rngs=rngs) for _ in range(config.depth)])
     self.merger = VisionPatchMerger(config, rngs=rngs)
 
   # ------------------------------------------------------------------

@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """Qwen3.5-0.8B VLM inference on TPU.
 
 This script uses the full tunix stack (no CPU stubs) and is designed to run
@@ -18,6 +19,50 @@ Usage:
 The checkpoint directory must contain the HF safetensors file(s) for
 Qwen/Qwen3.5-0.8B.  The directory is passed to both the LM and vision loaders.
 """
+
+import os
+import sys
+from typing import Any, Callable
+
+# 强行设置环境变量，优先级最高
+os.environ["JAX_PROCESS_COUNT"] = "1"
+os.environ["JAX_PROCESS_ID"] = "0"
+os.environ["JAX_COORDINATION_SERVICE_ADDR"] = "localhost:8888"
+os.environ["TPU_CHIPS_PER_HOST_BOUNDS"] = "2,2,1"
+os.environ["TPU_HOST_BOUNDS"] = "1,1,1"
+os.environ["TPU_MIN_DRIVERS"] = "1"
+
+# 禁用 TensorFlow 抢占 TPU (如果脚本里有 TF/Keras)
+os.environ["TPU_VISIBLE_DEVICES"] = "" 
+
+import jax
+# 强制屏蔽分布式初始化
+def dummy_init(*args, **kwargs):
+    print('JAX Distributed Init Suppressed (Single-node mode)')
+    return
+try:
+    import jax.distributed
+    jax.distributed.initialize = dummy_init
+except:
+    pass
+
+# ---------------------------------------------------------------------------
+# Persistent XLA compilation cache
+# Must be set BEFORE any jax.jit call (i.e., before model loading).
+# On first run: compiles and saves. On subsequent runs: loads from disk.
+# Cache key = hash(XLA computation) + JAX version + hardware.
+# ---------------------------------------------------------------------------
+_DEFAULT_JAX_CACHE = os.path.expanduser('~/.cache/jax_compile_cache/qwen3_5')
+
+def _enable_jax_cache(cache_dir: str):
+    os.makedirs(cache_dir, exist_ok=True)
+    jax.config.update('jax_compilation_cache_dir', cache_dir)
+    # Only persist compilations that took >= 5 s (avoids caching trivial ops).
+    jax.config.update('jax_persistent_cache_min_compile_time_secs', 5.0)
+    print(f'[JAX cache] Persistent compilation cache: {cache_dir}')
+
+print("Local Devices:", jax.local_device_count())
+from pathlib import Path
 
 import argparse
 import math
@@ -126,56 +171,152 @@ def build_vlm_embeddings(lm_model, vis_model, input_ids, pixel_patches, grid_thw
 
 
 # --------------------------------------------------------------------------
-# Greedy sampler
+# Greedy sampler — power-of-2 padded prefill + lax.scan decode
 # --------------------------------------------------------------------------
+
+def _next_pow2(n: int) -> int:
+  """Smallest power of 2 >= n (minimum 1). Limits recompilation to O(log N) buckets."""
+  p = 1
+  while p < n:
+    p <<= 1
+  return p
+
+
+def _make_prefill_fn(lm_model):
+  """JIT-compiled prefill (text tokens)."""
+  @jax.jit
+  def prefill(tokens, positions, attn_mask, cache):
+    return lm_model(
+        input_tokens=tokens, positions=positions,
+        cache=cache, attention_mask=attn_mask,
+    )
+  return prefill
+
+
+def _make_prefill_embed_fn(lm_model):
+  """JIT-compiled prefill (pre-built embeddings, VLM path)."""
+  @jax.jit
+  def prefill_embed(dummy_tokens, positions, attn_mask, cache, embeddings):
+    return lm_model(
+        input_tokens=dummy_tokens, positions=positions,
+        cache=cache, attention_mask=attn_mask,
+        input_embeddings=embeddings,
+    )
+  return prefill_embed
+
+
+def _make_scan_decode_fn(lm_model, T_pad: int, n_steps: int):
+  """JIT-compiled lax.scan decode.
+
+  Using T_pad (not actual prompt_len) as the base position means every prompt
+  padded to the same power-of-2 bucket shares one compiled decode kernel.
+
+  Args:
+    T_pad:   power-of-2 padded prefill length (static, baked into XLA).
+    n_steps: max_new_tokens - 1  (static scan length, baked into XLA).
+  """
+  @jax.jit
+  def run_decode(first_token, cache, dec_mask):
+    """
+    first_token : scalar int32 — first generated token (from prefill logit).
+    cache       : per-layer KV/conv/recurrent cache.
+    dec_mask    : [1, 1, cache_size] bool — prefill positions already True.
+    Returns     : [n_steps] int32 token ids.
+    """
+    def body(carry, step):
+      cache, dec_mask, last_token = carry
+      pos     = T_pad + step                                   # traced scalar
+      tok     = last_token[None, None]                         # [1, 1]
+      pos_arr = jnp.full((1, 1), pos, dtype=jnp.int32)        # [1, 1]
+      # Mark this position valid before running attention.
+      dec_mask = jax.lax.dynamic_update_slice(
+          dec_mask, jnp.ones((1, 1, 1), jnp.bool_), (0, 0, pos)
+      )
+      logits, new_cache = lm_model(
+          input_tokens=tok, positions=pos_arr,
+          cache=cache, attention_mask=dec_mask,
+      )
+      next_tok = jnp.argmax(logits[0, 0]).astype(jnp.int32)
+      return (new_cache, dec_mask, next_tok), next_tok
+
+    steps = jnp.arange(n_steps, dtype=jnp.int32)
+    init  = (cache, dec_mask, jnp.asarray(first_token, jnp.int32))
+    (_, _, _), all_tokens = jax.lax.scan(body, init, steps)
+    return all_tokens  # [n_steps]
+
+  return run_decode
+
 
 def greedy_generate(lm_model, input_ids, max_new_tokens=200,
                     eos_token_id=151645, input_embeddings=None):
-  """Greedy autoregressive decoding.
+  """Greedy decode: power-of-2 padded prefill + lax.scan decode loop."""
+  import time
+  prompt_len    = len(input_ids)
+  T_pad         = _next_pow2(prompt_len)          # static prefill length
+  cache_size    = T_pad + max_new_tokens           # static cache length
+  pad_len       = T_pad - prompt_len
+  compute_dtype = lm_model.config.dtype
 
-  Prefill uses a 3-D causal mask [B, T_q, cache_size] which is applied even
-  when the KV cache is non-null (fix in model.py).  Decode step uses a
-  [B, 1, cache_size] mask attending to all positions written so far.
-  """
-  prompt_len = len(input_ids)
-  cache_size = prompt_len + max_new_tokens + 4
-
-  tokens = jnp.array(input_ids, dtype=jnp.int32)[None, :]
-  positions = jnp.arange(prompt_len, dtype=jnp.int32)[None, :]
-
-  causal = jnp.tril(jnp.ones((prompt_len, prompt_len), dtype=jnp.bool_))
-  attn_mask = jnp.pad(
-      causal[None], ((0, 0), (0, 0), (0, cache_size - prompt_len))
-  )  # [1, prompt_len, cache_size]
-
-  cache = lm_model.init_cache(
-      batch_size=1, cache_size=cache_size, dtype=jnp.bfloat16,
+  # ---- Pad inputs to T_pad ----
+  ids_np      = np.array(input_ids, dtype=np.int32)
+  tokens_pad  = jnp.pad(jnp.array(ids_np)[None], ((0, 0), (0, pad_len)))
+  pos_pad     = jnp.pad(
+      jnp.arange(prompt_len, dtype=jnp.int32)[None], ((0, 0), (0, pad_len))
   )
 
-  logits, cache = lm_model(
-      input_tokens=tokens, positions=positions, cache=cache,
-      attention_mask=attn_mask, input_embeddings=input_embeddings,
-  )
-  next_token = int(jnp.argmax(logits[0, -1]))
-  generated = [next_token]
-  if next_token == eos_token_id:
+  # ---- Prefill mask [1, T_pad, cache_size] ----
+  # Real rows: lower-triangular causal.
+  # Padded rows: attend to position 0 only (prevents softmax NaN on all-inf rows).
+  mask_np = np.zeros((1, T_pad, cache_size), dtype=bool)
+  for i in range(prompt_len):
+    mask_np[0, i, :i + 1] = True
+  if pad_len > 0:
+    mask_np[0, prompt_len:, 0] = True   # safe dummy for padded queries
+  attn_mask = jnp.array(mask_np)
+
+  # ---- Cache + initial decode mask ----
+  cache    = lm_model.init_cache(batch_size=1, cache_size=cache_size, dtype=compute_dtype)
+  # Decode will start at T_pad; mark the real prefill positions as valid.
+  dec_mask = jnp.zeros((1, 1, cache_size), dtype=jnp.bool_)
+  dec_mask = dec_mask.at[0, 0, :prompt_len].set(True)
+
+  # ---- Prefill ----
+  t0 = time.perf_counter()
+  if input_embeddings is not None:
+    embed_pad = jnp.pad(input_embeddings, ((0, 0), (0, pad_len), (0, 0)))
+    logits, cache = _make_prefill_embed_fn(lm_model)(
+        tokens_pad, pos_pad, attn_mask, cache, embed_pad
+    )
+  else:
+    logits, cache = _make_prefill_fn(lm_model)(tokens_pad, pos_pad, attn_mask, cache)
+  logits.block_until_ready()
+  t_pre = time.perf_counter() - t0
+  print(f'     Prefill ({prompt_len} tok, pad→{T_pad}): '
+        f'{t_pre*1000:.1f} ms  [{prompt_len/t_pre:.0f} tok/s]')
+
+  # Logit at the last *real* token (padded positions are garbage).
+  first_token = int(jnp.argmax(logits[0, prompt_len - 1]))
+  generated   = [first_token]
+  if first_token == eos_token_id or max_new_tokens <= 1:
     return generated
 
-  for step in range(max_new_tokens - 1):
-    pos = prompt_len + step
-    tok = jnp.array([[next_token]], dtype=jnp.int32)
-    pos_arr = jnp.array([[pos]], dtype=jnp.int32)
-    dec_mask = jnp.zeros((1, 1, cache_size), dtype=jnp.bool_)
-    dec_mask = dec_mask.at[0, 0, :pos + 1].set(True)
-    logits, cache = lm_model(
-        input_tokens=tok, positions=pos_arr,
-        cache=cache, attention_mask=dec_mask,
-    )
-    next_token = int(jnp.argmax(logits[0, 0]))
-    generated.append(next_token)
-    if next_token == eos_token_id:
-      break
+  # ---- lax.scan decode ----
+  n_steps        = max_new_tokens - 1
+  scan_decode_fn = _make_scan_decode_fn(lm_model, T_pad, n_steps)
 
+  t1         = time.perf_counter()
+  all_tokens = scan_decode_fn(first_token, cache, dec_mask)
+  all_tokens.block_until_ready()
+  t_dec      = time.perf_counter() - t1
+
+  # Truncate at first EOS (scan always runs the full n_steps in XLA).
+  all_np  = np.array(all_tokens, dtype=np.int32)
+  eos_pos = np.where(all_np == eos_token_id)[0]
+  n_keep  = int(eos_pos[0]) + 1 if len(eos_pos) else len(all_np)
+  generated.extend(all_np[:n_keep].tolist())
+
+  print(f'     Decode  ({n_steps} XLA steps → {n_keep} used): '
+        f'{t_dec*1000:.1f} ms  [{n_steps/t_dec:.1f} tok/s]')
   return generated
 
 
@@ -199,7 +340,14 @@ def main():
   parser.add_argument('--dtype', default='bfloat16',
                       choices=['float32', 'bfloat16'],
                       help='Model weight dtype')
+  parser.add_argument('--jax_cache_dir', default=_DEFAULT_JAX_CACHE,
+                      help='Directory for JAX persistent compilation cache '
+                           '(set to empty string "" to disable)')
   args = parser.parse_args()
+
+  # Enable compile cache BEFORE any jax.jit / model loading.
+  if args.jax_cache_dir:
+    _enable_jax_cache(args.jax_cache_dir)
 
   # --- JAX / TPU init ---
   env_utils.setup_sharding_environment()
@@ -215,6 +363,7 @@ def main():
   # --- Language model ---
   print(f'[2] Loading LM from {args.ckpt_dir} (dtype={args.dtype})...')
   lm_cfg = qwen_model.ModelConfig.qwen3_5_0p8b()
+  lm_cfg.dtype = dtype
   lm = qwen_params.create_model_from_safe_tensors(
       file_dir=args.ckpt_dir,
       config=lm_cfg,
