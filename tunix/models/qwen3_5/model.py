@@ -641,15 +641,15 @@ class Attention(nnx.Module):
           shd.NamedSharding(mesh, P(shd_n, shd_t))
       )
 
-      @shard_map(
-          mesh=mesh,
+      sharded_splash_attn = shard_map(
+          lambda kernel, q_block, k_block, v_block: jax.vmap(kernel)(
+              q_block, k_block, v_block
+          ),
+          mesh,
           in_specs=(kernel_spec, shd_spec, unsharded_seq, unsharded_seq),
           out_specs=shd_spec,
           check_rep=False,
       )
-      def sharded_splash_attn(kernel, q_block, k_block, v_block):
-        return jax.vmap(kernel)(q_block, k_block, v_block)
-
       qkv = sharded_splash_attn(
           splash_attn_kernel, query_proj, key_proj, value_proj
       )
