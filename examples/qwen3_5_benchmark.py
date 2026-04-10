@@ -214,6 +214,10 @@ def main():
                         help='Timed iterations (mean is reported)')
     parser.add_argument('--prefill_only', action='store_true',
                         help='Skip decode benchmark (faster)')
+    parser.add_argument('--flash_attention', action='store_true',
+                        help='Enable Pallas Splash Attention for prefill (t > 256)')
+    parser.add_argument('--flash_block_size', type=int, default=512,
+                        help='Splash Attention block size (default 512)')
     parser.add_argument('--jax_cache_dir', default=_DEFAULT_JAX_CACHE,
                         help='JAX persistent compilation cache dir ("" to disable)')
     args = parser.parse_args()
@@ -232,8 +236,18 @@ def main():
     print(f'Loading model from {args.ckpt_dir} ...')
     cfg = qwen_model.ModelConfig.qwen3_5_0p8b()
     cfg.dtype = dtype
+    if args.flash_attention:
+        cfg.use_flash_attention = True
+        cfg.flash_attention_block_size = args.flash_block_size
+        mesh = jax.sharding.Mesh(
+            np.array(jax.devices()).reshape(1, -1, 1, 1),
+            axis_names=('fsdp', 'tp', 'sp', 'expert'),
+        )
+        print(f'Flash attention ON (block={args.flash_block_size}, mesh={mesh.shape})')
+    else:
+        mesh = None
     lm = qwen_params.create_model_from_safe_tensors(
-        file_dir=args.ckpt_dir, config=cfg, dtype=dtype,
+        file_dir=args.ckpt_dir, config=cfg, mesh=mesh, dtype=dtype,
     )
     print(f'Model loaded. Devices: {jax.devices()}\n')
 
